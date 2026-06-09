@@ -1,12 +1,12 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import * as Tone from 'tone';
-import { extractDominantColors, mapColorToNote, rgbToHsl } from './chromesthesia';
+import { extractDominantColors, mapColorToNote } from './chromesthesia';
 
 function CameraToSound() {
   const [isActive, setIsActive] = useState(false);
   const [dominantColors, setDominantColors] = useState([]);
   const [chordNotes, setChordNotes] = useState([]);
-  const [focusPoint, setFocusPoint] = useState(null); // null = whole frame
+  const [focusPoint, setFocusPoint] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
 
   const videoRef = useRef(null);
@@ -15,8 +15,10 @@ function CameraToSound() {
   const streamRef = useRef(null);
   const animFrameRef = useRef(null);
   const synthRef = useRef(null);
+  const currentFreqsRef = useRef([]);
+  const playingRef = useRef(false);
 
-  const FOCUS_RADIUS = 60; // px radius for tap-to-focus
+  const FOCUS_RADIUS = 60;
 
   const startCamera = async () => {
     try {
@@ -32,22 +34,22 @@ function CameraToSound() {
         videoRef.current.play();
       }
 
-      // Create a polyphonic synth for chord playback
-      synthRef.current = new Tone.PolySynth(Tone.Synth, {
-        maxPolyphony: 4,
-        voice: Tone.Synth,
-        options: {
+      // Use individual synths for smooth frequency gliding
+      const synths = [];
+      for (let i = 0; i < 4; i++) {
+        const synth = new Tone.Synth({
           oscillator: { type: 'sine' },
           envelope: {
-            attack: 0.3,
-            decay: 0.4,
-            sustain: 0.6,
-            release: 1.5,
+            attack: 0.4,
+            decay: 0.3,
+            sustain: 0.7,
+            release: 1.2,
           },
-        },
-      }).toDestination();
-
-      synthRef.current.volume.value = -8;
+        }).toDestination();
+        synth.volume.value = -14;
+        synths.push(synth);
+      }
+      synthRef.current = synths;
 
       setIsActive(true);
       setFocusPoint(null);
@@ -61,15 +63,41 @@ function CameraToSound() {
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
     if (synthRef.current) {
-      synthRef.current.releaseAll();
-      synthRef.current.dispose();
+      synthRef.current.forEach((s) => {
+        s.triggerRelease();
+        s.dispose();
+      });
     }
+    playingRef.current = false;
     setIsActive(false);
     setIsPlaying(false);
     setDominantColors([]);
     setChordNotes([]);
     setFocusPoint(null);
   };
+
+  const updateSound = useCallback((notes) => {
+    if (!synthRef.current || !playingRef.current) return;
+
+    const synths = synthRef.current;
+
+    notes.forEach((note, i) => {
+      if (i >= synths.length) return;
+      const synth = synths[i];
+      const targetFreq = note.frequency;
+      const prevFreq = currentFreqsRef.current[i];
+
+      if (!prevFreq) {
+        // First note — trigger attack
+        synth.triggerAttack(targetFreq, Tone.now(), note.velocity * 0.4);
+      } else if (Math.abs(targetFreq - prevFreq) > 2) {
+        // Frequency changed — ramp smoothly
+        synth.frequency.rampTo(targetFreq, 0.3);
+      }
+    });
+
+    currentFreqsRef.current = notes.map((n) => n.frequency);
+  }, []);
 
   const analyzeFrame = useCallback(() => {
     const video = videoRef.current;
@@ -86,7 +114,6 @@ function CameraToSound() {
 
     let imageData;
     if (focusPoint) {
-      // Extract only the focused region
       const x = Math.max(0, Math.round(focusPoint.x * canvas.width) - FOCUS_RADIUS);
       const y = Math.max(0, Math.round(focusPoint.y * canvas.height) - FOCUS_RADIUS);
       const w = Math.min(FOCUS_RADIUS * 2, canvas.width - x);
@@ -99,20 +126,21 @@ function CameraToSound() {
     const colors = extractDominantColors(imageData, 4);
     setDominantColors(colors);
 
-    // Map each color to a musical note
     const notes = colors.map((c) => {
       const note = mapColorToNote(c.h, c.s, c.l);
       return { ...note, color: c };
     });
     setChordNotes(notes);
 
+    // Continuously update sound if playing
+    updateSound(notes);
+
     drawOverlay(colors);
 
-    // Slow down analysis to ~4fps (every 250ms) for stability
     setTimeout(() => {
       animFrameRef.current = requestAnimationFrame(analyzeFrame);
-    }, 250);
-  }, [focusPoint]);
+    }, 200);
+  }, [focusPoint, updateSound]);
 
   const drawOverlay = (colors) => {
     const overlay = overlayCanvasRef.current;
@@ -128,7 +156,6 @@ function CameraToSound() {
 
     ctx.clearRect(0, 0, w, h);
 
-    // Draw focus circle if active
     if (focusPoint) {
       const fx = focusPoint.x * w;
       const fy = focusPoint.y * h;
@@ -145,7 +172,7 @@ function CameraToSound() {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.5)';
       ctx.font = '11px -apple-system, sans-serif';
       ctx.textAlign = 'center';
-      ctx.fillText('tap elsewhere to move focus', fx, fy + fr + 18);
+      ctx.fillText('tap elsewhere to move · tap circle to clear', fx, fy + fr + 18);
     }
   };
 
@@ -156,7 +183,6 @@ function CameraToSound() {
     const x = (e.clientX - rect.left) / rect.width;
     const y = (e.clientY - rect.top) / rect.height;
 
-    // If tapping near existing focus, clear it (go back to whole frame)
     if (focusPoint) {
       const dx = x - focusPoint.x;
       const dy = y - focusPoint.y;
@@ -168,45 +194,27 @@ function CameraToSound() {
     setFocusPoint({ x, y });
   };
 
-  const playChord = () => {
-    if (!synthRef.current || chordNotes.length === 0) return;
-
-    synthRef.current.releaseAll();
-
-    const frequencies = chordNotes.map((n) => n.frequency);
-    const velocities = chordNotes.map((n) => n.velocity);
-
-    frequencies.forEach((freq, i) => {
-      synthRef.current.triggerAttack(freq, Tone.now(), velocities[i] * 0.5);
-    });
-
-    setIsPlaying(true);
-
-    // Release after 3 seconds
-    setTimeout(() => {
-      if (synthRef.current) {
-        synthRef.current.releaseAll();
-        setIsPlaying(false);
-      }
-    }, 3000);
-  };
-
-  const playAndHold = () => {
+  const toggleSound = () => {
     if (!synthRef.current || chordNotes.length === 0) return;
 
     if (isPlaying) {
-      synthRef.current.releaseAll();
+      // Stop all synths
+      synthRef.current.forEach((s) => s.triggerRelease());
+      currentFreqsRef.current = [];
+      playingRef.current = false;
       setIsPlaying(false);
-      return;
+    } else {
+      // Start continuous playback
+      playingRef.current = true;
+      setIsPlaying(true);
+
+      chordNotes.forEach((note, i) => {
+        if (i < synthRef.current.length) {
+          synthRef.current[i].triggerAttack(note.frequency, Tone.now(), note.velocity * 0.4);
+        }
+      });
+      currentFreqsRef.current = chordNotes.map((n) => n.frequency);
     }
-
-    const frequencies = chordNotes.map((n) => n.frequency);
-    const velocities = chordNotes.map((n) => n.velocity);
-
-    frequencies.forEach((freq, i) => {
-      synthRef.current.triggerAttack(freq, Tone.now(), velocities[i] * 0.5);
-    });
-    setIsPlaying(true);
   };
 
   useEffect(() => {
@@ -241,7 +249,6 @@ function CameraToSound() {
         )}
       </div>
 
-      {/* Color → Note display */}
       {dominantColors.length > 0 && (
         <div className="color-notes">
           {chordNotes.map((note, i) => (
@@ -250,6 +257,7 @@ function CameraToSound() {
                 className="note-color-swatch"
                 style={{
                   background: `rgb(${note.color.r}, ${note.color.g}, ${note.color.b})`,
+                  boxShadow: isPlaying ? `0 0 8px rgb(${note.color.r}, ${note.color.g}, ${note.color.b})` : 'none',
                 }}
               />
               <div className="note-info">
@@ -270,10 +278,10 @@ function CameraToSound() {
           <div className="camera-controls">
             <button
               className={`listen-btn ${isPlaying ? 'active' : ''}`}
-              onClick={playAndHold}
+              onClick={toggleSound}
               disabled={chordNotes.length === 0}
             >
-              {isPlaying ? '■ Stop chord' : '♫ Play chord'}
+              {isPlaying ? '■ Stop sound' : '♫ Start sound'}
             </button>
             <button className="listen-btn stop" onClick={stopCamera}>
               ✕ Close
@@ -283,9 +291,9 @@ function CameraToSound() {
         <p className="hint">
           {!isActive
             ? 'Open your camera to see colors become sound'
-            : focusPoint
-            ? 'Tap the focus circle to go back to whole frame'
-            : 'Tap anywhere on the video to focus on a specific area'}
+            : isPlaying
+            ? 'Sound shifts continuously as colors change · tap video to focus'
+            : 'Tap Start sound — the chord will follow the camera in real time'}
         </p>
       </div>
     </div>
